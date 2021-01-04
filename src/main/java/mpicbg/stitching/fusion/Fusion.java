@@ -29,6 +29,54 @@ import ij.ImagePlus;
 import ij.ImageStack;
 import ij.io.FileSaver;
 
+import ij.io.FileInfo;
+import ij.measure.Calibration;
+import ij.process.ByteProcessor;
+import ij.process.ColorProcessor;
+import ij.process.FloatProcessor;
+import ij.process.ImageProcessor;
+import ij.process.ShortProcessor;
+//import imagej.data.Dataset;
+//import imagej.data.DefaultDataset;
+
+
+
+import ome.xml.model.enums.EnumerationException;
+import loci.common.DataTools;
+import loci.common.StatusEvent;
+import loci.common.StatusListener;
+import loci.common.StatusReporter;
+import loci.common.services.DependencyException;
+import loci.common.services.ServiceException;
+import loci.common.services.ServiceFactory;
+import loci.formats.FormatException;
+import loci.formats.FormatTools;
+import loci.formats.IFormatWriter;
+import loci.formats.ImageWriter;
+import loci.formats.MetadataTools;
+import loci.formats.gui.AWTImageTools;
+import loci.formats.meta.IMetadata;
+import loci.formats.ome.OMEXMLMetadata;
+import loci.formats.out.AVIWriter;
+import loci.formats.out.LegacyQTWriter;
+import loci.formats.out.QTWriter;
+import loci.formats.services.OMEXMLService;
+import ome.xml.meta.OMEXMLMetadataRoot;
+import ome.xml.model.enums.DimensionOrder;
+import ome.xml.model.primitives.PositiveInteger;
+import ome.xml.model.enums.PixelType;
+
+import ome.units.unit.Unit;
+import ome.units.UNITS;
+import ome.units.quantity.Length;
+import ome.units.quantity.Time;
+
+import java.awt.Image;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.util.HashMap;
+
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -65,6 +113,9 @@ import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.FloatType;
 import stitching.utils.CompositeImageFixer;
 import stitching.utils.Log;
+
+// import loci.plugins.out.Exporter;
+// import loci.plugins.LociExporter;
 
 /**
  * Manages the fusion for all types except the overlayfusion
@@ -941,8 +992,15 @@ public class Fusion
 				
 				// write the slice
 				final ImagePlus outImp = ((ImagePlusImg<?,?>)outputSlice).getImagePlus();
-				final FileSaver fs = new FileSaver( outImp );
-				fs.saveAsTiff( new File( outputDirectory, "img_t" + lz( t, numTimePoints ) + "_z" + lz( slice+1, numSlices ) + "_c" + lz( c, numChannels ) ).getAbsolutePath() );
+				//final FileSaver fs = new FileSaver( outImp );
+				//fs.saveAsTiff( new File( outputDirectory, "img_t" + lz( t, numTimePoints ) + "_z" + lz( slice+1, numSlices ) + "_c" + lz( c, numChannels ) ).getAbsolutePath() );
+				//IJ.run(outImp, "Bio-Formats Exporter", "save=[" + new File( outputDirectory, "img_t" + lz( t, numTimePoints ) + "_z" + lz( slice+1, numSlices ) + "_c" + lz( c, numChannels ) + ".btf" ).getAbsolutePath() + "] compression=zlib");
+				
+				// LociExporter lociplugin = LociExporter();
+				// lociplugin.arg = "outfile=" + new File( outputDirectory, "img_t" + lz( t, numTimePoints ) + "_z" + lz( slice+1, numSlices ) + "_c" + lz( c, numChannels ) + ".btf" ).getAbsolutePath() + " " + "windowless=true compression=zlib saveROI=false";
+				// Exporter exporter = Exporter(lociplugin, outImp);
+				// exporter.run();
+				writeImagePlus(new File( outputDirectory, "img_t" + lz( t, numTimePoints ) + "_z" + lz( slice+1, numSlices ) + "_c" + lz( c, numChannels ) + ".tif" ).getAbsolutePath(),outImp);
 				}
 		} 
 		catch ( NoninvertibleModelException e ) 
@@ -955,6 +1013,450 @@ public class Fusion
 			Log.error( "Output image has no ImageJ type: " + e );
 			return;
 		}
+		catch ( IOException e)
+		{
+			Log.error( "IOException: " + e );
+			return;
+		}
+		catch ( FormatException e)
+		{
+			Log.error( "FormatException: " + e );
+			return;
+		}
+		catch ( RuntimeException e)
+		{
+			Log.error( "RuntimeException: " + e );
+			return;
+		}
+		catch ( DependencyException e)
+		{
+			Log.error( "DependencyException: " + e );
+			return;
+		}
+		catch ( ServiceException e)
+		{
+			Log.error( "ServiceException: " + e );
+			return;
+		}
+		catch ( EnumerationException e)
+		{
+			Log.error( "EnumerationException: " + e );
+			return;
+		}
+	}
+	
+	protected static void writeImagePlus(String filename, ImagePlus imp) 
+				throws RuntimeException, IOException, FormatException, 
+						DependencyException, ServiceException,EnumerationException{
+		
+		int ptype = 0;		// pixel type ID
+		int channels = 1;	// number of channels per pixel (samples per pixel/color channels...), NOT ImagePlus channels
+		
+		// set pixel type corresponding to the present ImageProcessor type
+		switch (imp.getType()) {
+		case ImagePlus.GRAY8:
+		case ImagePlus.COLOR_256:
+			ptype = FormatTools.UINT8;
+			break;
+		case ImagePlus.COLOR_RGB:
+			channels = 3;
+			ptype = FormatTools.UINT8;
+			break;
+		case ImagePlus.GRAY16:
+			ptype = FormatTools.UINT16;
+			break;
+		case ImagePlus.GRAY32:
+			ptype = FormatTools.FLOAT;
+			break;
+		}
+		
+		// image title
+		String title = imp.getTitle();
+
+		// new image writer
+		IFormatWriter w = new ImageWriter().getWriter(filename);
+		FileInfo fi = imp.getOriginalFileInfo();
+		String xml = fi == null ? null : fi.description == null ? null :
+			fi.description.indexOf("xml") == -1 ? null : fi.description;
+
+		
+		// ------- prepare the OME XML meta data object ---------
+		
+		// create a OME XML meta data store
+		ServiceFactory factory = new ServiceFactory();
+		OMEXMLService service = factory.getInstance(OMEXMLService.class);
+		IMetadata store = service.createOMEXMLMetadata(xml);
+
+//		if (store == null) {
+//			throw new RuntimeException("ImageWriterMTB.writeImagePlus(..): OME-XML Java library not available.");
+//		}
+		if (xml == null) {
+			store.createRoot();
+		}
+		else if (store.getImageCount() > 1) {
+			// the original dataset had multiple series
+			// we need to modify the IMetadata to represent the correct series
+			// (a series is one microscopy imaging run, which can be stored with others in one experiment dataset, see e.g. lif-files) 
+
+			ArrayList<Integer> matchingSeries = new ArrayList<Integer>();
+			for (int series=0; series<store.getImageCount(); series++) {
+				String type = store.getPixelsType(series).toString();
+				int pixelType = FormatTools.pixelTypeFromString(type);
+				if (pixelType == ptype) {
+					String imageName = store.getImageName(series);
+					if (title.indexOf(imageName) >= 0) {
+						matchingSeries.add(series);
+					}
+				}
+			}
+
+			int series = 0;
+			if (matchingSeries.size() > 1) {
+				for (int i=0; i<matchingSeries.size(); i++) {
+					int index = matchingSeries.get(i);
+					String name = store.getImageName(index);
+					boolean valid = true;
+					for (int j=0; j<matchingSeries.size(); j++) {
+						if (i != j) {
+							String compName = store.getImageName(matchingSeries.get(j));
+							if (compName.indexOf(name) >= 0) {
+								valid = false;
+								break;
+							}
+						}
+					}
+					if (valid) {
+						series = index;
+						break;
+					}
+				}
+			}
+			else if (matchingSeries.size() == 1) 
+				series = matchingSeries.get(0);
+
+			// remove all non-matching series entries from the OME XML meta data object
+//			OME root = (OME) store.getRoot();
+			OMEXMLMetadataRoot root = (OMEXMLMetadataRoot)store.getRoot();
+			ome.xml.model.Image exportImage = root.getImage(series);
+			List<ome.xml.model.Image> allImages = root.copyImageList();
+			for (ome.xml.model.Image img : allImages) {
+				if (!img.equals(exportImage)) {
+					root.removeImage(img);
+				}
+			}
+			store.setRoot(root);
+		}
+
+		// set image dimensions
+		store.setPixelsSizeX(new PositiveInteger(imp.getWidth()), 0);
+		store.setPixelsSizeY(new PositiveInteger(imp.getHeight()), 0);
+		store.setPixelsSizeZ(new PositiveInteger(imp.getNSlices()), 0);
+		store.setPixelsSizeC(new PositiveInteger(channels*imp.getNChannels()), 0);
+		store.setPixelsSizeT(new PositiveInteger(imp.getNFrames()), 0);
+
+		
+		if (store.getImageName(0) == null) {
+			store.setImageName(title, 0);
+		}
+		
+		if (store.getImageID(0) == null) {
+			store.setImageID(MetadataTools.createLSID("Image", 0), 0);
+		}
+		
+		if (store.getPixelsID(0) == null) {
+			store.setPixelsID(MetadataTools.createLSID("Pixels", 0), 0);
+		}
+
+		if (store.getPixelsType(0) == null) {
+			store.setPixelsType(PixelType.fromString(FormatTools.getPixelTypeString(ptype)), 0);
+		}
+
+		if (store.getPixelsBinDataCount(0) == 0 ||
+				store.getPixelsBinDataBigEndian(0, 0) == null) {
+			// if we don't have any information about bit order, select little endian
+			store.setPixelsBinDataBigEndian(Boolean.FALSE, 0, 0);
+			store.setPixelsBigEndian(Boolean.FALSE, 0);
+		}
+		
+		if (store.getPixelsDimensionOrder(0) == null) {
+				store.setPixelsDimensionOrder(DimensionOrder.XYCZT, 0);
+		}
+
+		String[] labels = imp.getStack().getSliceLabels();
+		for (int c=0; c<imp.getNChannels(); c++) {
+	
+			if (c >= store.getChannelCount(0) || store.getChannelID(0, c) == null) {
+				
+				String lsid = MetadataTools.createLSID("Channel", 0, c);
+
+				store.setChannelID(lsid, 0, c);
+			}
+			
+			if (c >= store.getChannelCount(0) || store.getChannelName(0, c) == null) {
+				if (labels != null && labels[c] != null) {
+					store.setChannelName(labels[c], 0, c);
+				}
+			}
+			
+			store.setChannelSamplesPerPixel(new PositiveInteger(channels), 0, c);
+		}
+
+		Calibration cal = imp.getCalibration();
+
+
+		//ImageIOUtils.physicalPixelSize_to_OME(cal, store, 0);
+		physicalPixelSize_to_OME(cal, store, 0);
+
+		// if (imp.getImageStackSize() !=
+					// imp.getNChannels() * imp.getNSlices() * imp.getNFrames()) {
+			
+			// if (!this.getIgnoreInvalidStackSpecification()) {
+				// throw new IllegalStateException("ImageWriterMTB.writeImagePlus(..): " +
+					// "The number of slices in the stack (" + imp.getImageStackSize() +
+					// ") does not match the number of expected slices (" +
+					// (imp.getNChannels() * imp.getNSlices() * imp.getNFrames()) + ").");
+			// }
+			// else {
+				// System.err.println("ImageWriterMTB.writeImagePlus(..): " +
+						// "The number of slices in the stack (" + imp.getImageStackSize() +
+						// ") does not match the number of expected slices (" +
+						// (imp.getNChannels() * imp.getNSlices() * imp.getNFrames()) + ")." +
+						// "\nOnly " + imp.getImageStackSize() +
+						// " planes will be exported.");
+				// store.setPixelsSizeZ(new PositiveInteger(imp.getImageStackSize()), 0);
+				// store.setPixelsSizeC(new PositiveInteger(1), 0);
+				// store.setPixelsSizeT(new PositiveInteger(1), 0);
+			// }
+		// }
+
+		// ------- configure the writer ---------
+		
+		// hand the meta data object to the writer
+		w.setMetadataRetrieve(store);
+
+		// set filename
+		w.setId(filename);
+		
+
+		// test if the output pixel type is supported by the writer
+		ImageProcessor proc = imp.getImageStack().getProcessor(1);
+		Image firstImage = proc.createImage();
+		firstImage = AWTImageTools.makeBuffered(firstImage, proc.getColorModel());
+		int thisType = AWTImageTools.getPixelType((BufferedImage) firstImage);
+		if (proc instanceof ColorProcessor) {
+			thisType = FormatTools.UINT8;
+		}
+
+		if (!proc.isDefaultLut()) {
+			w.setColorModel(proc.getColorModel());
+		}
+
+		boolean notSupportedType = !w.isSupportedType(thisType);
+		if (notSupportedType) {
+			throw new IllegalArgumentException("ImageWriterMTB.writeImagePlus(..): Pixel type '" 
+					+ FormatTools.getPixelTypeString(thisType) + "' not supported by this format.");
+		}
+		
+		// if (this.getCompression() != null && ! this.getCompression().isEmpty() )
+			// w.setCompression(this.getCompression());
+		w.setCompression("zlib");
+
+		// movie writer options
+		// if (w instanceof AVIWriter || w instanceof QTWriter || w instanceof LegacyQTWriter) {
+			// if (this.getFps() != null)
+				// w.setFramesPerSecond(this.getFps());
+			
+			// if (this.getQuality() != null) {
+				// if (w instanceof QTWriter)
+					// ((QTWriter)w).setQuality(this.getQuality());
+				// else if (w instanceof LegacyQTWriter)
+					// ((LegacyQTWriter)w).setQuality(this.getQuality());
+			// }
+			
+			// if (this.getCodec() != null) {
+				// if (w instanceof QTWriter)
+					// ((QTWriter)w).setCodec(this.getCodec());
+				// else if (w instanceof LegacyQTWriter)
+					// ((LegacyQTWriter)w).setCodec(this.getCodec());
+			// }
+		// }
+		
+		// convert and save slices
+		int size = imp.getImageStackSize();
+		ImageStack is = imp.getImageStack();
+		
+		if (!w.canDoStacks() && size > 1) {
+			System.err.println("WARNING: ImageWriterMTB.writeImagePlus(.): Image format cannot handle stacks. " +
+					"Writing only slice " + imp.getCurrentSlice() + ".");                                                                  
+		}
+		
+		boolean doStack = w.canDoStacks() && size > 1;
+		int start = doStack ? 0 : imp.getCurrentSlice() - 1;
+		int end = doStack ? size : start + 1;
+
+		boolean littleEndian =
+			!w.getMetadataRetrieve().getPixelsBinDataBigEndian(0, 0).booleanValue();
+		byte[] plane = null;
+		w.setInterleaved(false);
+		
+		// boolean verbose = this.getVerbose();
+		
+		// if (verbose) {
+			// System.out.println(ImageIOUtils.imgWriteInfo(filename, w, 0));
+		// }
+		
+		int no = 0;
+		for (int i=start; i<end; i++) {
+			// if (doStack) {
+				// this.notifyListeners(new StatusEvent(i, size, "Saving slice " + (i + 1) + "/" + size));
+				// if (verbose) {
+					// if (i != start)
+						// System.out.print("\r");
+					// System.out.print("Saving slice " + (i + 1) + "/" + imp.getStack().getSize() + "...");
+				// }
+			// }
+			// else {
+				// this.notifyListeners(new StatusEvent("Saving image"));
+				// if (verbose)
+					// System.out.print("Saving image...");
+			// }
+			
+			//Log.error( "0" );
+			proc = is.getProcessor(i + 1);
+
+//			if (proc instanceof RecordedImageProcessor) {
+//				proc = ((RecordedImageProcessor) proc).getChild();
+//			}
+
+			//Log.error( "1" );
+			int x = proc.getWidth();
+			int y = proc.getHeight();
+
+			//Log.error( "2" );
+			if (proc instanceof ByteProcessor) {
+				plane = (byte[]) proc.getPixels();
+			}
+			else if (proc instanceof ShortProcessor) {
+				plane = DataTools.shortsToBytes(
+						(short[]) proc.getPixels(), littleEndian);
+			}
+			else if (proc instanceof FloatProcessor) {
+				plane = DataTools.floatsToBytes(
+						(float[]) proc.getPixels(), littleEndian);
+			}
+			else if (proc instanceof ColorProcessor) {
+				byte[][] pix = new byte[3][x*y];
+				((ColorProcessor) proc).getRGB(pix[0], pix[1], pix[2]);
+				plane = new byte[3 * x * y];
+				System.arraycopy(pix[0], 0, plane, 0, x * y);
+				System.arraycopy(pix[1], 0, plane, x * y, x * y);
+				System.arraycopy(pix[2], 0, plane, 2 * x * y, x * y);
+			}
+
+			//Log.error( "3" );
+			w.saveBytes(no++, plane);
+			//Log.error( "4" );
+		}
+		w.close();
+
+
+		// if (verbose)
+			// System.out.println(" DONE");
+
+	}
+	
+/**
+	 * Set OME meta data for image of index <code>imageIdx</code> using 
+	 * information from a <code>Calibration</code> object.
+	 * 
+	 * @param cal				Calibration object.
+	 * @param omemeta		OME object where to store calibration metadata.
+	 * @param imageIdx	Index of image.
+	 */
+	public static void physicalPixelSize_to_OME(Calibration cal, IMetadata omemeta, int imageIdx) {
+
+		Unit<Length> ul = UNITS.MICROMETER;
+
+		if (toMicrons(cal.pixelWidth, cal.getXUnit()) > 0.0) {
+			omemeta.setPixelsPhysicalSizeX(
+				new Length(
+					new Double(toMicrons(cal.pixelWidth, cal.getXUnit())), 
+						ul), imageIdx);
+		}
+			
+		if (toMicrons(cal.pixelHeight, cal.getYUnit()) > 0.0) {
+			omemeta.setPixelsPhysicalSizeY(
+				new Length(
+					new Double(toMicrons(cal.pixelHeight, cal.getYUnit())), 
+						ul), imageIdx);
+		}
+		
+		if (toMicrons(cal.pixelDepth, cal.getZUnit()) > 0.0) {
+			omemeta.setPixelsPhysicalSizeZ(
+				new Length(
+					new Double(toMicrons(cal.pixelDepth, cal.getZUnit())), 
+						ul), imageIdx);
+		}
+
+		Unit<Time> ut = Unit.CreateBaseUnit(cal.getTimeUnit(), "s");
+		Time t = new Time(new Double(
+				toSeconds(cal.frameInterval, cal.getTimeUnit())), ut);
+		omemeta.setPixelsTimeIncrement(t, imageIdx);		
+	}
+	
+	/**
+	 * Convert a value of given space unit to microns.
+	 * @param val		Value to convert.
+	 * @param unit	Source unit.
+	 * @return	Value in microns.
+	 */
+	public static double toMicrons(double val, String unit) {
+		if (   unit.equalsIgnoreCase("micron") || unit.equalsIgnoreCase("microns") 
+				|| unit.equalsIgnoreCase("um") || unit.equalsIgnoreCase("micrometer"))
+			return val;
+		else if (unit.equalsIgnoreCase("pm") || unit.equalsIgnoreCase("picometer"))
+			return val * 0.000001;
+		else if (unit.equalsIgnoreCase("nm") || unit.equalsIgnoreCase("nanometer"))
+			return val * 0.001;
+		else if (unit.equalsIgnoreCase("mm") || unit.equalsIgnoreCase("millimeter"))
+			return val * 1000;
+		else if (unit.equalsIgnoreCase("cm") || unit.equalsIgnoreCase("centimeter"))
+			return val * 10000;
+		else if (unit.equalsIgnoreCase("dm") || unit.equalsIgnoreCase("decimeter"))
+			return val * 100000;
+		else if (unit.equalsIgnoreCase("m") || unit.equalsIgnoreCase("meter"))
+			return val * 1000000;
+		else if (unit.equalsIgnoreCase("km") || unit.equalsIgnoreCase("kilometer"))
+			return val * 1000000000;
+		else if (unit.equalsIgnoreCase("inch") || unit.equalsIgnoreCase("inches"))
+			return val * 25.4 * 1000.0;
+		else if (unit.equalsIgnoreCase("pixel") || unit.equalsIgnoreCase("pixels"))
+			return 0.0;
+		else
+			return -1.0;
+	}
+	/**
+	 * Convert a value of given time unit to seconds.
+	 * @param val
+	 * @param unit
+	 * @return
+	 */
+	public static double toSeconds(double val, String unit) {
+		if (unit.equalsIgnoreCase("sec") || unit.equalsIgnoreCase("s") 
+				|| unit.equalsIgnoreCase("second") || unit.equalsIgnoreCase("seconds"))
+			return val;
+		else if (unit.equalsIgnoreCase("psec") || unit.equalsIgnoreCase("ps"))
+			return val * 0.000000001;
+		else if (unit.equalsIgnoreCase("nsec") || unit.equalsIgnoreCase("ns"))
+			return val * 0.000001;
+		else if (unit.equalsIgnoreCase("msec") || unit.equalsIgnoreCase("ms"))
+			return val * 0.001;
+		else if (unit.equalsIgnoreCase("min") || unit.equalsIgnoreCase("m"))
+			return val * 60.0;
+		else if (unit.equalsIgnoreCase("hour") || unit.equalsIgnoreCase("h") || unit.equalsIgnoreCase("std"))
+			return val * 360.0;
+		else
+			return 0.0;
 	}
 
 	/**
