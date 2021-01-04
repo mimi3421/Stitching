@@ -1,4 +1,4 @@
-This version of plugin which is forked form the original Imagej/Fuji Grid/Collection stitching plugin exports *zlib* compressed tilted *tif* image to minimize the file size. 
+This version of plugin forked form the original Imagej/Fuji Grid/Collection stitching plugin exports *zlib* compressed tilted *tif* image to minimize the file size. 
 
 [![](https://travis-ci.org/fiji/Stitching.svg?branch=master)](https://travis-ci.org/fiji/Stitching)
 
